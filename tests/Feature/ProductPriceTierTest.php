@@ -15,6 +15,7 @@ namespace Tests\Feature;
 use App\Factory\InvoiceItemFactory;
 use App\Models\Invoice;
 use App\Models\Product;
+use App\Models\Quote;
 use App\Utils\Traits\MakesHash;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
@@ -80,7 +81,7 @@ class ProductPriceTierTest extends TestCase
         return $product;
     }
 
-    private function postInvoice(array $item_overrides = []): array
+    private function postInvoice(array $item_overrides = [], array $doc_overrides = []): array
     {
         $item = InvoiceItemFactory::create();
         $item->product_key = 'TIERED-PROD';
@@ -92,10 +93,20 @@ class ProductPriceTierTest extends TestCase
             $item->{$key} = $value;
         }
 
-        $response = $this->withHeaders($this->apiHeaders())->postJson('/api/v1/invoices', [
+        $response = $this->withHeaders($this->apiHeaders())->postJson('/api/v1/invoices', array_merge([
             'client_id' => $this->client->hashed_id,
             'line_items' => [$item],
-        ]);
+        ], $doc_overrides));
+
+        $response->assertStatus(200);
+
+        return $response->json('data');
+    }
+
+    private function putInvoice(string $hashed_id, array $payload): array
+    {
+        $response = $this->withHeaders($this->apiHeaders())
+            ->putJson('/api/v1/invoices/' . $hashed_id, $payload);
 
         $response->assertStatus(200);
 
@@ -122,6 +133,8 @@ class ProductPriceTierTest extends TestCase
 
     public function testPriceTierValidationRequiresPriceOrDiscount()
     {
+        $this->withExceptionHandling();
+
         $this->withHeaders($this->apiHeaders())->postJson('/api/v1/products', [
             'product_key' => 'TIERED-BAD',
             'price' => 4,
@@ -145,12 +158,27 @@ class ProductPriceTierTest extends TestCase
     {
         $this->makeTieredProduct();
 
-        $data = $this->postInvoice(['quantity' => 60]);
+        /* quantity 60 hits the {"min_quantity": 50, "discount": 20} tier;
+         * in percent mode the percent is written directly */
+        $data = $this->postInvoice(['quantity' => 60], ['is_amount_discount' => false]);
 
-        /* quantity 60 hits the {"min_quantity": 50, "discount": 20} tier */
         $this->assertEquals(20, (float) $data['line_items'][0]['discount']);
         $this->assertFalse((bool) $data['line_items'][0]['is_amount_discount']);
         $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testDiscountTierInAmountModeWritesEquivalentAmount()
+    {
+        $this->makeTieredProduct();
+
+        /* in amount mode the same tier writes the equivalent fixed
+         * amount (10 x 60 x 20% = 120) - identical effective price */
+        $data = $this->postInvoice(['quantity' => 60], ['is_amount_discount' => true]);
+
+        $this->assertEquals(120, (float) $data['line_items'][0]['discount']);
+        $this->assertTrue((bool) $data['line_items'][0]['is_amount_discount']);
+        $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+        $this->assertStringContainsString('Quantity discount: 20%', (string) $data['line_items'][0]['notes']);
     }
 
     public function testNoTierBelowThreshold()
@@ -205,6 +233,8 @@ class ProductPriceTierTest extends TestCase
 
     public function testPriceTiersModeValidation()
     {
+        $this->withExceptionHandling();
+
         $this->withHeaders($this->apiHeaders())->postJson('/api/v1/products', [
             'product_key' => 'TIERED-MODE',
             'price' => 4,
@@ -288,5 +318,207 @@ class ProductPriceTierTest extends TestCase
         $data = $this->postInvoice(['quantity' => 20]);
 
         $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testBasePriceRestoredWhenQuantityDropsBelowTier()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20]);
+
+        $item = $invoice['line_items'][0];
+        $item['quantity'] = 5;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        /* re-derivation starts from the captured base cost, not the
+         * previously calculated tier cost */
+        $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testDiscountTierAppliesToBasePriceNotTieredCost()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20], ['is_amount_discount' => false]);
+
+        $item = $invoice['line_items'][0];
+        $item['quantity'] = 60;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        /* 20% applies to the base price of 10 (effective 8), not to
+         * the previously tiered cost of 9 (which would yield 7.20) */
+        $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+        $this->assertEquals(20, (float) $data['line_items'][0]['discount']);
+    }
+
+    public function testTierDiscountClearedWhenDroppingBackToPriceTier()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 60], ['is_amount_discount' => false]);
+
+        $item = $invoice['line_items'][0];
+        $item['quantity'] = 20;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        /* the engine owned 20% discount is removed and the price
+         * tier applies - not both stacked */
+        $this->assertEquals(9, (float) $data['line_items'][0]['cost']);
+        $this->assertEquals(0, (float) $data['line_items'][0]['discount']);
+    }
+
+    public function testOptOutRestoresTieredCost()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20]);
+
+        $item = $invoice['line_items'][0];
+        $item['use_price_tiers'] = false;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+        $this->assertStringNotContainsString('Quantity pricing', (string) $data['line_items'][0]['notes']);
+    }
+
+    public function testOptOutRestoresTierDiscount()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 60], ['is_amount_discount' => false]);
+
+        $item = $invoice['line_items'][0];
+        $item['use_price_tiers'] = false;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        $this->assertEquals(0, (float) $data['line_items'][0]['discount']);
+        $this->assertStringNotContainsString('Quantity discount', (string) $data['line_items'][0]['notes']);
+    }
+
+    public function testUnrelatedUpdateDoesNotRepriceAfterTierChange()
+    {
+        $product = $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20]);
+
+        /* the product tier changes after the document was priced */
+        $product->price_tiers = [['min_quantity' => 10, 'price' => 7]];
+        $product->save();
+
+        $data = $this->putInvoice($invoice['id'], ['date' => '2026-11-01']);
+
+        /* an unrelated field update must not implicitly refresh pricing */
+        $this->assertEquals(9, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testUnchangedLineIsNotRepricedAfterTierChange()
+    {
+        $product = $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20]);
+
+        $product->price_tiers = [['min_quantity' => 10, 'price' => 7]];
+        $product->save();
+
+        /* resave echoing the stored line items unchanged */
+        $data = $this->putInvoice($invoice['id'], ['line_items' => $invoice['line_items']]);
+
+        $this->assertEquals(9, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testEnablingFeatureDoesNotRepriceExistingDocuments()
+    {
+        $this->company->enable_price_tiers = false;
+        $this->company->save();
+
+        $product = $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 20]);
+
+        $this->company->enable_price_tiers = true;
+        $this->company->save();
+
+        /* unrelated update after enabling the feature */
+        $data = $this->putInvoice($invoice['id'], ['date' => '2026-11-01']);
+
+        $this->assertEquals(10, (float) $data['line_items'][0]['cost']);
+
+        /* only an actual line item edit triggers tier resolution */
+        $item = $data['line_items'][0];
+        $item['quantity'] = 21;
+
+        $data = $this->putInvoice($invoice['id'], ['line_items' => [$item]]);
+
+        $this->assertEquals(9, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testManualDiscountRespectedWithExplicitOptIn()
+    {
+        $this->makeTieredProduct();
+
+        /* explicit use_price_tiers=true must not allow the tier to
+         * overwrite a manually entered discount */
+        $data = $this->postInvoice(['quantity' => 60, 'discount' => 33, 'use_price_tiers' => true]);
+
+        $this->assertEquals(33, (float) $data['line_items'][0]['discount']);
+    }
+
+    public function testManualLineCostIsNotOverwrittenByTier()
+    {
+        $this->makeTieredProduct();
+
+        /* a cost the user typed (differing from the product base price)
+         * is user-owned and kept */
+        $data = $this->postInvoice(['quantity' => 20, 'cost' => 50]);
+
+        $this->assertEquals(50, (float) $data['line_items'][0]['cost']);
+    }
+
+    public function testEngineDiscountIsNotMistakenForManualDiscount()
+    {
+        $this->makeTieredProduct();
+
+        $invoice = $this->postInvoice(['quantity' => 60], ['is_amount_discount' => false]);
+
+        /* unchanged resave: the engine written discount and its note
+         * must both survive intact */
+        $data = $this->putInvoice($invoice['id'], ['line_items' => $invoice['line_items']]);
+
+        $this->assertEquals(20, (float) $data['line_items'][0]['discount']);
+        $this->assertStringContainsString('Quantity discount', (string) $data['line_items'][0]['notes']);
+    }
+
+    public function testQuoteConversionKeepsAgreedTieredPrice()
+    {
+        $product = $this->makeTieredProduct();
+
+        $item = InvoiceItemFactory::create();
+        $item->product_key = 'TIERED-PROD';
+        $item->type_id = '1';
+        $item->cost = 10;
+        $item->quantity = 20;
+
+        $response = $this->withHeaders($this->apiHeaders())->postJson('/api/v1/quotes', [
+            'client_id' => $this->client->hashed_id,
+            'line_items' => [$item],
+        ])->assertStatus(200);
+
+        $quote = Quote::find($this->decodePrimaryKey($response->json('data.id')));
+
+        $this->assertEquals(9, (float) $quote->line_items[0]->cost);
+
+        /* the tier price changes before the agreed quote is converted */
+        $product->price_tiers = [['min_quantity' => 10, 'price' => 7]];
+        $product->save();
+
+        $invoice = $quote->service()->convertToInvoice();
+
+        /* the agreed price is preserved - conversion is not a repricing point */
+        $this->assertEquals(9, (float) $invoice->line_items[0]->cost);
     }
 }

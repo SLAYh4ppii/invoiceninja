@@ -227,9 +227,18 @@ class BaseRepository
             }
         }
 
-        /* Resolve quantity based product price tiers */
+        /* Resolve quantity based product price tiers; the stored line items
+         * are passed so unchanged lines keep their pricing snapshot */
         if (is_array($model->line_items)) {
-            $model->line_items = (new ApplyPriceTiers())->run($model->line_items, $model->company, $model->client);
+            $original_items = $model->getRawOriginal('line_items');
+
+            $model->line_items = (new ApplyPriceTiers())->run(
+                $model->line_items,
+                is_string($original_items) ? json_decode($original_items) : null,
+                (bool) $model->is_amount_discount,
+                $model->company,
+                $model->client
+            );
         }
 
         $model->saveQuietly();
